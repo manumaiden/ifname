@@ -2,6 +2,12 @@
 
 Analyzes how network interfaces are renamed by reading a udev database, in the format produced by a sosreport. Not RHEL-specific: it just parses `udevadm info --export-db` output, so it works on any systemd-based Linux distribution (also tested on Fedora). Style and output aligned with its companion tool `sos-net` (`--ifname`/`--ifname-d`).
 
+## In action
+
+`ifname --detail` against a sample system (onboard NICs, a hwdb-named management interface, a rename via custom udev rule, one via a `.link` file, and a legacy ifcfg/HWADDR binding — sample data, not a real system):
+
+![ifname --detail](docs/screenshots/ifname-detail.png)
+
 ## Requirements
 
 - Python 3.9+
