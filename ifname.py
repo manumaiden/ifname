@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# DESC: Explain RHEL network interface renaming from a sosreport.
+# DESC: Diagnose network interface renaming from a systemd udev database (e.g. a sosreport).
 """
 ifname - Analyze network interface renaming from a sosreport udev database.
 
@@ -514,7 +514,7 @@ def resolve_sos_root(arg: str) -> Path:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Explain RHEL network interface renaming from a sosreport."
+        description="Diagnose network interface renaming from a systemd udev database (e.g. a sosreport)."
     )
     ap.add_argument(
         "-v", "--version", action="version",
