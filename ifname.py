@@ -13,6 +13,7 @@ Or pass the sosreport root (or the udev DB file directly) as an argument:
 
 import argparse
 import configparser
+import os
 import re
 import sys
 from pathlib import Path
@@ -54,8 +55,8 @@ class _NoColorStream:
         return self._s.fileno()
 
 
-__version__    = "1.0"
-__build_date__ = "28082026"
+__version__    = "1.1"
+__build_date__ = "21102026"
 
 UDEVADM_DB = Path("sos_commands/devices/udevadm_info_--export-db")
 
@@ -88,6 +89,18 @@ RE_NET_INDICATOR = re.compile(
 # Udev rule: NAME="..." value and ATTR{address}=="..." value, for rename-map lookups
 RE_NAME_VALUE = re.compile(r'\bNAME="([^"]+)"')
 RE_ATTR_ADDR = re.compile(r'ATTR\{address\}=="([0-9a-fA-F:]+)"')
+
+_LINK_DIRS = ("etc/systemd/network", "usr/lib/systemd/network")
+
+# Default naming policy per RHEL major release: RHEL 7 renames in
+# 80-net-name-slot.rules, RHEL 8+ via 80-net-setup-link.rules + the NamePolicy
+# of 99-default.link (RHEL 8: no "keep"; RHEL 9/10: with "keep").
+DEFAULT_POLICY = {
+    7:  ("onboard → slot → path", "80-net-name-slot.rules, RHEL 7"),
+    8:  ("kernel database onboard slot path", "default, 99-default.link"),
+    9:  ("keep kernel database onboard slot path", "default, 99-default.link"),
+    10: ("keep kernel database onboard slot path", "default, 99-default.link"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +162,9 @@ def parse_blocks(path: Path):
             elif line.startswith("E: ") and "=" in line[3:]:
                 k, v = line[3:].split("=", 1)
                 block[k] = v
-        if RE_PCI_NET.match(block.get("P", "")):
+        # only the net device itself — not child devices living under its
+        # sysfs dir (e.g. r8169 LEDs: /net/enp7s0/enp7s0-0::lan, SUBSYSTEM=leds)
+        if RE_PCI_NET.match(block.get("P", "")) and block.get("SUBSYSTEM", "net") == "net":
             yield block
 
 
@@ -161,24 +176,44 @@ def get_naming_scheme(db_path: Path) -> str | None:
     return None
 
 
-def naming_source(block: dict, prefix: str | None = None) -> tuple[str, str]:
-    """Return (source_label, chosen_name) explaining how the interface was named."""
+def naming_source(block: dict, prefix: str | None = None,
+                  ctx: dict | None = None) -> tuple[str, str]:
+    """Return (source_label, name) for what actually produced the interface name.
+
+    Matched against the real name, not just the first ID_NET_NAME_* candidate:
+    75-net-description.rules always fills the candidates (also with biosdevname,
+    udev rules or masked naming), and the mac policy is never used by default.
+    ctx: {"rename_map", "link_names" {name: file}, "ifcfg_devices" {name: file}}.
+    """
     iface = block.get("INTERFACE", block.get("M", "?"))
-    has_systemd = any(k in block for k, _ in SYSTEMD_PRIO)
+    ctx = ctx or {}
 
     if prefix and re.match(rf"^{re.escape(prefix)}\d+$", iface):
         return f"prefixdevname [{prefix}<n>]", iface
 
-    if RE_BIOSDEVNAME.match(iface) and not has_systemd:
-        return "biosdevname", iface
-
     for key, label_ in SYSTEMD_PRIO:
-        if key in block:
+        if block.get(key) == iface:
             if key == "ID_NET_NAME_ONBOARD" and "ID_NET_LABEL_ONBOARD" in block:
                 label_ = f"onboard [{block['ID_NET_LABEL_ONBOARD']}]"
-            return label_, block[key]
+            elif key == "ID_NET_NAME_MAC":
+                label_ = "mac (non-default policy)"
+            return label_, iface
 
-    return "none (kernel name)", iface
+    rmap = ctx.get("rename_map") or {"by_mac": {}, "by_name": {}}
+    hit = rmap["by_mac"].get(mac_from_block(block))
+    if hit and hit[0] == iface:
+        return f"udev rule ({hit[1]})", iface
+    if iface in rmap["by_name"]:
+        return f"udev rule ({rmap['by_name'][iface]})", iface
+    if iface in ctx.get("link_names", {}):
+        return f".link ({ctx['link_names'][iface]})", iface
+    if iface in ctx.get("ifcfg_devices", {}):
+        return f"ifcfg DEVICE= ({ctx['ifcfg_devices'][iface]})", iface
+    if RE_BIOSDEVNAME.match(iface):
+        return "biosdevname", iface
+    if re.match(r"^eth\d+$", iface):
+        return "kernel name", iface
+    return "unknown (no matching candidate)", iface
 
 
 def all_candidates(block: dict) -> str:
@@ -225,11 +260,12 @@ def udev_rename_map(udev_rules: list[dict]) -> dict:
     return {"by_mac": by_mac, "by_name": by_name}
 
 
-def check_mismatch(block: dict, rename_map: dict) -> tuple[str, bool] | None:
+def check_mismatch(block: dict, rename_map: dict, source: str = "") -> tuple[str, bool] | None:
     """Return (message, explained) if ID_NET_NAME disagrees with INTERFACE, else None.
 
-    'explained' is True when a custom udev rule accounts for the rename (worth a
-    note, not a red flag); False when the rename cause is unknown (worth a warning).
+    'explained' is True when a custom udev rule — or the naming source itself
+    (biosdevname, prefixdevname, .link, ifcfg DEVICE=) — accounts for the rename
+    (worth a note, not a red flag); False when the cause is unknown (warning).
     """
     udev_name = block.get("ID_NET_NAME", "")
     iface = block.get("INTERFACE", block.get("M", ""))
@@ -246,6 +282,10 @@ def check_mismatch(block: dict, rename_map: dict) -> tuple[str, bool] | None:
     if iface in rename_map["by_name"]:
         return (f"MISMATCH: ID_NET_NAME={udev_name} vs INTERFACE={iface}"
                 f"  (PCI {pci}, renamed by {rename_map['by_name'][iface]})", True)
+    if source.split(" (")[0] in ("biosdevname", ".link", "ifcfg DEVICE=") \
+            or source.startswith("prefixdevname"):
+        return (f"MISMATCH: ID_NET_NAME={udev_name} vs INTERFACE={iface}"
+                f"  (PCI {pci}, renamed by {source})", True)
     return (f"MISMATCH: ID_NET_NAME={udev_name} vs INTERFACE={iface}  (PCI {pci})", False)
 
 
@@ -271,50 +311,197 @@ def parse_cmdline(sos_root: Path):
         "net_ifnames": params.get("net.ifnames"),       # "0", "1", or None
         "biosdevname": params.get("biosdevname"),        # "0", "1", or None
         "ifnames_prefix": params.get("net.ifnames.prefix"),  # e.g. "net", or None
+        "naming_scheme": params.get("net.naming-scheme"),    # e.g. "rhel-9.4", or None
     }
 
 
-def print_cmdline_section(cmdline, sos_root: Path, naming_scheme: str | None = None) -> None:
-    subsection("Kernel cmdline  (net.ifnames / biosdevname / net.ifnames.prefix)")
+def rhel_major(sos_root: Path) -> int:
+    """RHEL / derivative major release from etc/redhat-release (0 if unknown)."""
+    f = sos_root / "etc/redhat-release"
+    if not f.is_file():
+        return 0
+    m = re.search(r"release (\d+)", f.read_text(errors="replace"))
+    return int(m.group(1)) if m else 0
+
+
+def manufacturer(sos_root: Path) -> str:
+    """System manufacturer from sos_commands/hardware/dmidecode ('' if unknown)."""
+    f = sos_root / "sos_commands/hardware/dmidecode"
+    if not f.is_file():
+        return ""
+    m = re.search(r"^System Information\n(?:\t.*\n)*?\tManufacturer:\s*(.+)$",
+                  f.read_text(errors="replace"), re.M)
+    return m.group(1).strip() if m else ""
+
+
+def link_policies(sos_root: Path) -> list[tuple[str, str]]:
+    """[(rel_path, NamePolicy)] for every collected .link file setting NamePolicy=."""
+    out = []
+    for rel_dir in _LINK_DIRS:
+        d = sos_root / rel_dir
+        if not d.is_dir():
+            continue
+        for lf in sorted(d.glob("*.link")):
+            if not lf.is_file():
+                continue
+            m = re.search(r"^\s*NamePolicy\s*=\s*(.+?)\s*$",
+                          lf.read_text(errors="replace"), re.M)
+            if m:
+                out.append((f"{rel_dir}/{lf.name}", m.group(1)))
+    return out
+
+
+def is_devnull(p: Path, sos_root: Path) -> bool:
+    """True if p is a symlink to /dev/null — sos rewrites absolute links as
+    relative to the sosreport root (e.g. ../../../dev/null)."""
+    if not p.is_symlink():
+        return False
+    tgt = os.readlink(p)
+    return tgt == "/dev/null" or \
+        os.path.normpath(p.parent / tgt) == os.path.normpath(sos_root / "dev" / "null")
+
+
+def find_masked(sos_root: Path) -> list[dict]:
+    """Naming-related udev rules / .link files masked with a link to /dev/null.
+
+    A mask only works if a file with the same name exists in usr/lib/: on
+    RHEL 7 80-net-name-slot.rules does, on RHEL 8+ it was dropped (naming goes
+    through 80-net-setup-link.rules + 99-default.link), so the classic RHEL 7
+    mask left behind by old kickstarts/images has no effect there.
+    Returns [{file, lib_dir, state}] with state effective|ineffective|unknown.
+    """
+    results = []
+    for etc_rel, lib_rel, pattern in (
+        ("etc/udev/rules.d",    "usr/lib/udev/rules.d",    "*net*.rules"),
+        ("etc/systemd/network", "usr/lib/systemd/network", "*.link"),
+    ):
+        etc_dir = sos_root / etc_rel
+        if not etc_dir.is_dir():
+            continue
+        lib_dir = sos_root / lib_rel
+        for f in sorted(etc_dir.glob(pattern)):
+            if not is_devnull(f, sos_root):
+                continue
+            if not lib_dir.is_dir():
+                state = "unknown"
+            elif (lib_dir / f.name).is_file():
+                state = "effective"
+            else:
+                state = "ineffective"
+            results.append({"file": f.name, "lib_dir": lib_rel, "state": state})
+    return results
+
+
+def print_cmdline_section(cmdline, sos_root: Path, naming_scheme: str | None,
+                          blocks: list[dict]) -> None:
+    subsection("Kernel cmdline  (net.ifnames / biosdevname / net.ifnames.prefix / net.naming-scheme)")
+    major = rhel_major(sos_root)
+    # RHEL 7 Networking Guide §11.9 ex. 11.3: kernel ethX names only "work
+    # correctly" with a single NIC, or with virtio NICs in RHEL 7 guests.
+    drivers = {b.get("ID_NET_DRIVER", "") for b in blocks}
+    if len(blocks) == 1:
+        ethx_ok = "supported case: single NIC"
+    elif major == 7 and blocks and drivers == {"virtio_net"}:
+        ethx_ok = "supported case: all NICs are virtio on RHEL 7"
+    else:
+        ethx_ok = ""
     print()
 
     if cmdline is None:
         label("proc/cmdline not found in sosreport")
-        return
-
-    ni = cmdline["net_ifnames"]
-    if ni is None:
-        kv("net.ifnames", f"{DIM}not set{RESET}  (default: enabled on RHEL 7+)")
-    elif ni == "1":
-        ok("net.ifnames=1  →  predictable naming enabled")
-    elif ni == "0":
-        warn("net.ifnames=0  →  predictable naming DISABLED",
-             "likely cause of eth* names instead of enXXX")
     else:
-        kv("net.ifnames", f"{ni}  (non-standard value)")
+        ni = cmdline["net_ifnames"]
+        if ni is None:
+            kv("net.ifnames", f"{DIM}not set{RESET}  (default: enabled on RHEL 7+)")
+        elif ni == "1":
+            ok("net.ifnames=1  →  predictable naming enabled")
+        elif ni == "0" and ethx_ok:
+            note(f"net.ifnames=0  →  predictable naming disabled — {ethx_ok} "
+                 f"(RHEL 7 Networking Guide §11.9 ex. 11.3)")
+        elif ni == "0":
+            warn("net.ifnames=0  →  predictable naming DISABLED",
+                 "likely cause of eth* names instead of enXXX",
+                 "Red Hat does not support systems with consistent device naming disabled")
+        else:
+            kv("net.ifnames", f"{ni}  (non-standard value)")
 
-    bd = cmdline["biosdevname"]
-    if bd is None:
-        kv("biosdevname", f"{DIM}not set{RESET}  (default: disabled on RHEL 8+)")
-    elif bd == "0":
-        ok("biosdevname=0  →  disabled")
-    elif bd == "1":
-        warn("biosdevname=1  →  ENABLED", "likely cause of em* / p*p* names")
+        bd = cmdline["biosdevname"]
+        if bd is None:
+            kv("biosdevname", f"{DIM}not set{RESET}  (default: disabled on RHEL 8+)")
+        elif bd == "0":
+            ok("biosdevname=0  →  disabled")
+        elif bd == "1":
+            warn("biosdevname=1  →  ENABLED", "likely cause of em* / p*p* names")
+        else:
+            kv("biosdevname", f"{bd}  (non-standard value)")
+        if (sos_root / "usr/lib/udev/rules.d/71-biosdevname.rules").is_file():
+            mfr = manufacturer(sos_root)
+            if "dell" in mfr.lower():
+                if bd != "0":
+                    note("biosdevname installed on a Dell system — it renames interfaces "
+                         "(em*, p*p*) unless biosdevname=0 is on the cmdline")
+            else:
+                note(f"biosdevname installed on a non-Dell system ({mfr or 'manufacturer unknown'}) "
+                     f"— Red Hat: install and use biosdevname only on Dell systems")
+
+        prefix = cmdline.get("ifnames_prefix")
+        if prefix is None:
+            kv("net.ifnames.prefix", f"{DIM}not set{RESET}")
+        else:
+            note(f"net.ifnames.prefix={prefix}  →  prefixdevname active: interfaces named "
+                 f"{prefix}0, {prefix}1, … (bypasses predictable naming)")
+            prefix_rules = sos_root / "usr/lib/udev/rules.d/71-prefixdevname.rules"
+            if not prefix_rules.exists():
+                warn("71-prefixdevname.rules not found in usr/lib/udev/rules.d/",
+                     "prefixdevname package may not be installed")
+
+    nns = cmdline.get("naming_scheme") if cmdline else None
+    kv("net.naming-scheme", nns if nns else f"{DIM}not set{RESET}")
+    if naming_scheme:
+        kv("naming scheme", naming_scheme)
+    elif major == 7:
+        kv("naming scheme", f"{DIM}n/a on RHEL 7 (net naming schemes start with RHEL 8){RESET}")
     else:
-        kv("biosdevname", f"{bd}  (non-standard value)")
+        kv("naming scheme", f"{DIM}not found in udev DB{RESET}")
+    if nns and naming_scheme and nns != naming_scheme:
+        warn(f"net.naming-scheme={nns} on the cmdline but udev used {naming_scheme}",
+             "reboot pending, or the initramfs was not rebuilt (dracut -f)?")
 
-    prefix = cmdline.get("ifnames_prefix")
-    if prefix is None:
-        kv("net.ifnames.prefix", f"{DIM}not set{RESET}")
-    else:
-        note(f"net.ifnames.prefix={prefix}  →  prefixdevname active: interfaces named "
-             f"{prefix}0, {prefix}1, … (bypasses predictable naming)")
-        prefix_rules = sos_root / "usr/lib/udev/rules.d/71-prefixdevname.rules"
-        if not prefix_rules.exists():
-            warn("71-prefixdevname.rules not found in usr/lib/udev/rules.d/",
-                 "prefixdevname package may not be installed")
+    policies = link_policies(sos_root)
+    lib_default = next((pol for f, pol in policies
+                        if f == "usr/lib/systemd/network/99-default.link"), None)
+    if lib_default:
+        kv("NamePolicy", f"{lib_default}  {DIM}(usr/lib/systemd/network/99-default.link){RESET}")
+    elif major in DEFAULT_POLICY:
+        pol, where = DEFAULT_POLICY[major]
+        kv("NamePolicy", f"{pol}  {DIM}({where}){RESET}")
+    for f, pol in policies:
+        if f.startswith("etc/"):
+            extra = " — the mac policy is not used by default" if "mac" in pol.split() else ""
+            note(f"{Path(f).name}: NamePolicy={pol} overrides the default for the "
+                 f"interfaces it matches{extra}")
 
-    kv("naming scheme", naming_scheme if naming_scheme else f"{DIM}not found in udev DB{RESET}")
+    eth_names = sorted(b.get("INTERFACE", "") for b in blocks
+                       if re.match(r"^eth\d+$", b.get("INTERFACE", "")))
+    for m in find_masked(sos_root):
+        if m["state"] == "effective" and eth_names and ethx_ok:
+            note(f"Consistent naming disabled: {m['file']} masked (→ /dev/null) — "
+                 f"interfaces keep kernel names ({', '.join(eth_names)}); {ethx_ok} "
+                 f"(RHEL 7 Networking Guide §11.9 ex. 11.3)")
+        elif m["state"] == "effective":
+            warn(f"Consistent naming disabled: {m['file']} masked (→ /dev/null) — "
+                 f"interfaces keep kernel names (eth*)",
+                 f"kernel names in use: {', '.join(eth_names)}" if eth_names else
+                 "but interfaces still have predictable names — mask added after the "
+                 "last boot, or initramfs not rebuilt (dracut -f)?",
+                 "Red Hat does not support systems with consistent device naming disabled")
+        elif m["state"] == "ineffective":
+            note(f"{m['file']} masked (→ /dev/null) but no such file in {m['lib_dir']}/ "
+                 f"on this release — mask has no effect (RHEL 8+ names via "
+                 f"80-net-setup-link.rules + 99-default.link; leftover from a RHEL 7 image/kickstart?)")
+        else:
+            note(f"{m['file']} masked (→ /dev/null) — {m['lib_dir']}/ not collected, "
+                 f"effect not verifiable")
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +515,8 @@ def find_udev_custom_rules(sos_root: Path) -> list[dict]:
         return []
     results = []
     for rf in sorted(rules_dir.glob("*.rules")):
+        if not rf.is_file():          # mask → /dev/null or dangling link
+            continue
         found = []
         for line in rf.read_text(errors="replace").splitlines():
             s = line.strip()
@@ -351,14 +540,18 @@ def print_udev_rules_section(rules: list[dict]) -> None:
             print(f"    {BOLD}{entry['file']}{RESET}")
             for rule in entry["rules"]:
                 print(f"      {DIM}{rule}{RESET}")
+        # RHEL 8/9/10 "Configuring user-defined network interface names by using
+        # udev rules": dracut only copies 70-persistent-net.rules into the initrd
+        for entry in rules:
+            if entry["file"] != "70-persistent-net.rules":
+                note(f"{entry['file']}: renaming rules outside 70-persistent-net.rules are not "
+                     f"copied into the initrd by dracut — names can differ during early boot "
+                     f"(network root / iSCSI)")
 
 
 # ---------------------------------------------------------------------------
 # systemd .link files
 # ---------------------------------------------------------------------------
-
-_LINK_DIRS = ("etc/systemd/network", "usr/lib/systemd/network")
-
 
 def find_link_files(sos_root: Path) -> list[dict]:
     """Find .link files that set Name= in their [Link] section."""
@@ -368,6 +561,8 @@ def find_link_files(sos_root: Path) -> list[dict]:
         if not d.is_dir():
             continue
         for lf in sorted(d.glob("*.link")):
+            if not lf.is_file():      # mask → /dev/null or dangling link
+                continue
             cfg = configparser.ConfigParser(strict=False)
             cfg.optionxform = str  # preserve key case (Name, MACAddress, …)
             try:
@@ -425,18 +620,29 @@ def find_ifcfg_hwaddr(sos_root: Path) -> list[dict]:
     return results
 
 
+def has_60_net_rules(sos_root: Path) -> bool:
+    return ((sos_root / "usr/lib/udev/rules.d/60-net.rules").exists()
+            or (sos_root / "etc/udev/rules.d/60-net.rules").exists())
+
+
 def print_ifcfg_section(sos_root: Path, blocks: list[dict]) -> None:
     subsection("ifcfg HWADDR renaming  (60-net.rules / rename_device)")
 
-    net_rules = ((sos_root / "usr/lib/udev/rules.d/60-net.rules").exists()
-                 or (sos_root / "etc/udev/rules.d/60-net.rules").exists())
-    print()
-    if net_rules:
-        kv("60-net.rules", f"{GREEN}present{RESET}  (rename_device active)")
-    else:
-        kv("60-net.rules", f"{DIM}not found in udev/rules.d/{RESET}")
-
+    rules_usr = sos_root / "usr/lib/udev/rules.d"
+    net_rules = has_60_net_rules(sos_root)
     entries = find_ifcfg_hwaddr(sos_root)
+    print()
+    # 60-net.rules (initscripts / initscripts-rename-device) runs rename_device
+    # only for ifcfg-* with HWADDR= — "udev skips this step" otherwise.
+    if net_rules and entries:
+        kv("60-net.rules", f"{GREEN}present{RESET}  (rename_device active)")
+    elif net_rules:
+        kv("60-net.rules", f"present  {DIM}(inactive: no ifcfg-* file with HWADDR=){RESET}")
+    elif rules_usr.is_dir():
+        kv("60-net.rules", f"{DIM}not found  (initscripts-rename-device not installed){RESET}")
+    else:
+        kv("60-net.rules", f"{DIM}not verifiable  (usr/lib/udev/rules.d/ not collected){RESET}")
+
     if not entries:
         ok("No ifcfg-* files with HWADDR= found")
         return
@@ -478,11 +684,24 @@ def print_ifcfg_section(sos_root: Path, blocks: list[dict]) -> None:
     for e in entries:
         matched = mac_to_iface.get(e["hwaddr"], "")
         if e["device"]:
-            if matched:
-                note(f"{matched} ({e['hwaddr']})  →  rename_device renames to "
-                     f"'{e['device']}' via {e['file']}")
-            else:
+            if not net_rules and rules_usr.is_dir():
+                warn(f"{e['file']}: DEVICE={e['device']} with HWADDR= but 60-net.rules is not "
+                     f"installed — rename_device never runs, the interface keeps its udev name"
+                     + (f" ({matched})" if matched else ""),
+                     "install initscripts-rename-device, or rename with a .link file / "
+                     "70-persistent-net.rules")
+            elif not matched:
                 warn(f"HWADDR {e['hwaddr']} in {e['file']} not matched to any known interface")
+            elif matched == e["device"]:
+                note(f"{matched} ({e['hwaddr']})  →  already named {e['device']} "
+                     f"(rename_device via {e['file']} is a no-op)")
+            elif re.match(r"^eth\d+$", e["device"]):
+                warn(f"{e['file']}: renames {matched} to {e['device']} in the kernel namespace — "
+                     f"fails ('File exists') when the kernel already uses that name",
+                     "RHEL 7 Networking Guide §11.9 ex. 11.3: use a non-ethX name")
+            else:
+                note(f"{matched} ({e['hwaddr']})  →  rename_device renames to "
+                     f"'{e['device']}' via {e['file']}  (not applied yet in this sosreport)")
         else:
             if matched:
                 note(f"{matched} ({e['hwaddr']})  →  NM binding via {e['file']} "
@@ -545,15 +764,16 @@ def main() -> None:
 
     section("INTERFACE NAMING")
 
-    # 1. Cmdline
-    cmdline = parse_cmdline(sos_root)
-    print_cmdline_section(cmdline, sos_root, get_naming_scheme(db_path))
-    ifnames_prefix = cmdline.get("ifnames_prefix") if cmdline else None
-
-    # 2. Interface table
     blocks = list(parse_blocks(db_path))
     udev_rules = find_udev_custom_rules(sos_root)
     rename_map = udev_rename_map(udev_rules)
+
+    # 1. Cmdline
+    cmdline = parse_cmdline(sos_root)
+    print_cmdline_section(cmdline, sos_root, get_naming_scheme(db_path), blocks)
+    ifnames_prefix = cmdline.get("ifnames_prefix") if cmdline else None
+
+    # 2. Interface table
 
     subsection("Network interfaces  (udevadm --export-db)")
     if not blocks:
@@ -561,18 +781,24 @@ def main() -> None:
     else:
         rows = []
         mismatches = []
+        src_ctx = {
+            "rename_map":    rename_map,
+            "link_names":    {lf["name"]: Path(lf["file"]).name for lf in find_link_files(sos_root)},
+            "ifcfg_devices": {e["device"]: e["file"] for e in find_ifcfg_hwaddr(sos_root)
+                              if e["device"]} if has_60_net_rules(sos_root) else {},
+        }
 
         for b in blocks:
             iface      = b.get("INTERFACE", b.get("M", "?"))
             pci        = pci_from_block(b)
-            source, _  = naming_source(b, ifnames_prefix)
+            source, _  = naming_source(b, ifnames_prefix, src_ctx)
             driver     = b.get("ID_NET_DRIVER", "—")
             scheme     = b.get("ID_NET_NAMING_SCHEME", "—")
             model      = b.get(
                 "ID_MODEL_FROM_DATABASE",
                 b.get("ID_MODEL_ENC", b.get("ID_MODEL", "—"))
             )
-            m = check_mismatch(b, rename_map)
+            m = check_mismatch(b, rename_map, source)
             if m:
                 mismatches.append(m)
 
