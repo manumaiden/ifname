@@ -49,7 +49,7 @@ python3 ifname.py --detail           # or -d, either way
 
 ```bash
 ifname -v
-# ifname version 1.2 (30102026) by manumaiden
+# ifname version 1.3 (30102026) by manumaiden
 ```
 
 On every normal run (not `-v`), the version is printed as the first line of output.

@@ -35,16 +35,17 @@ WHITE   = "\033[97m"
 BG_BLUE = "\033[44m"
 
 # Any terminal escape sequence: CSI (ESC [ … final byte), OSC (ESC ] … BEL/ST)
-# or a two-byte ESC x. Only our own colors (SGR "ESC[…m") may reach the terminal.
+# or a two-byte ESC x. Only our own colors (_OWN_SGR, exact match) may reach the terminal.
 _TERM_ESC_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
-_SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")     # C0 controls except \t \n
+_OWN_SGR = {RESET, BOLD, DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE, BG_BLUE}
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")  # C0 (except \t \n), DEL, C1 (8-bit CSI/OSC)
 
 
 class _SafeStream:
     """Stdout wrapper applied to every run: sosreport content (udev properties,
     rule files) is untrusted, so OSC (clipboard, title), cursor/erase sequences,
-    SGR 8 (concealed text) and control characters (\r, BEL, …) are dropped.
+    any SGR that is not one of ours (concealed, reverse, blink, …) and C0/C1
+    control characters (\r, BEL, 8-bit CSI/OSC, …) are dropped.
     color=False (--no-color or no TTY) drops our SGR colors as well."""
     def __init__(self, stream, color: bool = True):
         self._s = stream
@@ -54,8 +55,7 @@ class _SafeStream:
         out, pos = [], 0
         for m in _TERM_ESC_RE.finditer(text):
             out.append(_CTRL_RE.sub("", text[pos:m.start()]))
-            g = _SGR_RE.fullmatch(m.group())
-            if self._color and g and "8" not in g.group(1).split(";"):
+            if self._color and m.group() in _OWN_SGR:
                 out.append(m.group())
             pos = m.end()
         out.append(_CTRL_RE.sub("", text[pos:]))
@@ -71,7 +71,7 @@ class _SafeStream:
         return self._s.fileno()
 
 
-__version__    = "1.2"
+__version__    = "1.3"
 __build_date__ = "30102026"
 
 UDEVADM_DB = Path("sos_commands/devices/udevadm_info_--export-db")
