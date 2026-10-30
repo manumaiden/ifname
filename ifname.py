@@ -34,16 +34,32 @@ CYAN    = "\033[36m"
 WHITE   = "\033[97m"
 BG_BLUE = "\033[44m"
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# Any terminal escape sequence: CSI (ESC [ … final byte), OSC (ESC ] … BEL/ST)
+# or a two-byte ESC x. Only our own colors (SGR "ESC[…m") may reach the terminal.
+_TERM_ESC_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
+_SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")     # C0 controls except \t \n
 
 
-class _NoColorStream:
-    """Stdout wrapper that strips ANSI escape codes on every write."""
-    def __init__(self, stream):
+class _SafeStream:
+    """Stdout wrapper applied to every run: sosreport content (udev properties,
+    rule files) is untrusted, so OSC (clipboard, title), cursor/erase sequences,
+    SGR 8 (concealed text) and control characters (\r, BEL, …) are dropped.
+    color=False (--no-color or no TTY) drops our SGR colors as well."""
+    def __init__(self, stream, color: bool = True):
         self._s = stream
+        self._color = color
 
     def write(self, text: str) -> int:
-        return self._s.write(_ANSI_RE.sub("", text))
+        out, pos = [], 0
+        for m in _TERM_ESC_RE.finditer(text):
+            out.append(_CTRL_RE.sub("", text[pos:m.start()]))
+            g = _SGR_RE.fullmatch(m.group())
+            if self._color and g and "8" not in g.group(1).split(";"):
+                out.append(m.group())
+            pos = m.end()
+        out.append(_CTRL_RE.sub("", text[pos:]))
+        return self._s.write("".join(out))
 
     def flush(self) -> None:
         self._s.flush()
@@ -55,8 +71,8 @@ class _NoColorStream:
         return self._s.fileno()
 
 
-__version__    = "1.1"
-__build_date__ = "21102026"
+__version__    = "1.2"
+__build_date__ = "30102026"
 
 UDEVADM_DB = Path("sos_commands/devices/udevadm_info_--export-db")
 
@@ -178,18 +194,19 @@ def get_naming_scheme(db_path: Path) -> str | None:
 
 def naming_source(block: dict, prefix: str | None = None,
                   ctx: dict | None = None) -> tuple[str, str]:
-    """Return (source_label, name) for what actually produced the interface name.
+    """Return (source_label, kind) for what actually produced the interface name.
 
     Matched against the real name, not just the first ID_NET_NAME_* candidate:
     75-net-description.rules always fills the candidates (also with biosdevname,
     udev rules or masked naming), and the mac policy is never used by default.
     ctx: {"rename_map", "link_names" {name: file}, "ifcfg_devices" {name: file}}.
+    kind is one of candidate, udev, link, ifcfg, biosdevname, prefixdevname, kernel, unknown.
     """
     iface = block.get("INTERFACE", block.get("M", "?"))
     ctx = ctx or {}
 
     if prefix and re.match(rf"^{re.escape(prefix)}\d+$", iface):
-        return f"prefixdevname [{prefix}<n>]", iface
+        return f"prefixdevname [{prefix}<n>]", "prefixdevname"
 
     for key, label_ in SYSTEMD_PRIO:
         if block.get(key) == iface:
@@ -197,23 +214,23 @@ def naming_source(block: dict, prefix: str | None = None,
                 label_ = f"onboard [{block['ID_NET_LABEL_ONBOARD']}]"
             elif key == "ID_NET_NAME_MAC":
                 label_ = "mac (non-default policy)"
-            return label_, iface
+            return label_, "candidate"
 
     rmap = ctx.get("rename_map") or {"by_mac": {}, "by_name": {}}
     hit = rmap["by_mac"].get(mac_from_block(block))
     if hit and hit[0] == iface:
-        return f"udev rule ({hit[1]})", iface
+        return f"udev rule ({hit[1]})", "udev"
     if iface in rmap["by_name"]:
-        return f"udev rule ({rmap['by_name'][iface]})", iface
+        return f"udev rule ({rmap['by_name'][iface]})", "udev"
     if iface in ctx.get("link_names", {}):
-        return f".link ({ctx['link_names'][iface]})", iface
+        return f".link ({ctx['link_names'][iface]})", "link"
     if iface in ctx.get("ifcfg_devices", {}):
-        return f"ifcfg DEVICE= ({ctx['ifcfg_devices'][iface]})", iface
+        return f"ifcfg DEVICE= ({ctx['ifcfg_devices'][iface]})", "ifcfg"
     if RE_BIOSDEVNAME.match(iface):
-        return "biosdevname", iface
+        return "biosdevname", "biosdevname"
     if re.match(r"^eth\d+$", iface):
-        return "kernel name", iface
-    return "unknown (no matching candidate)", iface
+        return "kernel name", "kernel"
+    return "unknown (no matching candidate)", "unknown"
 
 
 def all_candidates(block: dict) -> str:
@@ -260,7 +277,8 @@ def udev_rename_map(udev_rules: list[dict]) -> dict:
     return {"by_mac": by_mac, "by_name": by_name}
 
 
-def check_mismatch(block: dict, rename_map: dict, source: str = "") -> tuple[str, bool] | None:
+def check_mismatch(block: dict, rename_map: dict, source: str = "",
+                   kind: str = "") -> tuple[str, bool] | None:
     """Return (message, explained) if ID_NET_NAME disagrees with INTERFACE, else None.
 
     'explained' is True when a custom udev rule — or the naming source itself
@@ -282,8 +300,7 @@ def check_mismatch(block: dict, rename_map: dict, source: str = "") -> tuple[str
     if iface in rename_map["by_name"]:
         return (f"MISMATCH: ID_NET_NAME={udev_name} vs INTERFACE={iface}"
                 f"  (PCI {pci}, renamed by {rename_map['by_name'][iface]})", True)
-    if source.split(" (")[0] in ("biosdevname", ".link", "ifcfg DEVICE=") \
-            or source.startswith("prefixdevname"):
+    if kind in ("biosdevname", "link", "ifcfg", "prefixdevname"):
         return (f"MISMATCH: ID_NET_NAME={udev_name} vs INTERFACE={iface}"
                 f"  (PCI {pci}, renamed by {source})", True)
     return (f"MISMATCH: ID_NET_NAME={udev_name} vs INTERFACE={iface}  (PCI {pci})", False)
@@ -373,6 +390,7 @@ def find_masked(sos_root: Path) -> list[dict]:
     results = []
     for etc_rel, lib_rel, pattern in (
         ("etc/udev/rules.d",    "usr/lib/udev/rules.d",    "*net*.rules"),
+        ("etc/udev/rules.d",    "usr/lib/udev/rules.d",    "71-*devname.rules"),
         ("etc/systemd/network", "usr/lib/systemd/network", "*.link"),
     ):
         etc_dir = sos_root / etc_rel
@@ -399,8 +417,8 @@ def print_cmdline_section(cmdline, sos_root: Path, naming_scheme: str | None,
     # RHEL 7 Networking Guide §11.9 ex. 11.3: kernel ethX names only "work
     # correctly" with a single NIC, or with virtio NICs in RHEL 7 guests.
     drivers = {b.get("ID_NET_DRIVER", "") for b in blocks}
-    if len(blocks) == 1:
-        ethx_ok = "supported case: single NIC"
+    if major == 7 and len(blocks) == 1:
+        ethx_ok = "supported case: single NIC on RHEL 7"
     elif major == 7 and blocks and drivers == {"virtio_net"}:
         ethx_ok = "supported case: all NICs are virtio on RHEL 7"
     else:
@@ -484,6 +502,20 @@ def print_cmdline_section(cmdline, sos_root: Path, naming_scheme: str | None,
     eth_names = sorted(b.get("INTERFACE", "") for b in blocks
                        if re.match(r"^eth\d+$", b.get("INTERFACE", "")))
     for m in find_masked(sos_root):
+        if m["file"].startswith("71-"):            # biosdevname / prefixdevname: optional
+            tool = m["file"][len("71-"):-len(".rules")]
+            if m["state"] == "effective":
+                note(f"{m['file']} masked (→ /dev/null) — {tool} renaming disabled")
+                pfx = cmdline.get("ifnames_prefix") if cmdline else None
+                if tool == "prefixdevname" and pfx:
+                    warn(f"net.ifnames.prefix={pfx} is set but 71-prefixdevname.rules is masked "
+                         f"— interfaces will not get {pfx}<n> names")
+            elif m["state"] == "ineffective":
+                note(f"{m['file']} masked (→ /dev/null) but {tool} is not installed — no effect")
+            else:
+                note(f"{m['file']} masked (→ /dev/null) — {m['lib_dir']}/ not collected, "
+                     f"effect not verifiable")
+            continue
         if m["state"] == "effective" and eth_names and ethx_ok:
             note(f"Consistent naming disabled: {m['file']} masked (→ /dev/null) — "
                  f"interfaces keep kernel names ({', '.join(eth_names)}); {ethx_ok} "
@@ -714,6 +746,25 @@ def print_ifcfg_section(sos_root: Path, blocks: list[dict]) -> None:
 # CLI argument resolution
 # ---------------------------------------------------------------------------
 
+def escaping_links(sos_root: Path) -> list[tuple[str, str]]:
+    """[(relative path, link target)] for symlinks resolving outside the sosreport.
+    sos only writes links inside the report (masks point to its own dev/null), so
+    an escaping link means a crafted archive that would make ifname read and print
+    files of the analyst's machine."""
+    root = os.path.realpath(sos_root)
+    out = []
+    for dp, dns, fns in os.walk(sos_root):          # does not follow directory links
+        for n in dns + fns:
+            p = os.path.join(dp, n)
+            if not os.path.islink(p):
+                continue
+            tgt, rp = os.readlink(p), os.path.realpath(p)
+            if tgt == "/dev/null" or rp == root or rp.startswith(root + os.sep):
+                continue
+            out.append((os.path.relpath(p, sos_root), tgt))
+    return out
+
+
 def resolve_sos_root(arg: str) -> Path:
     """Resolve the sosreport root from a CLI argument that may be the root
     directory itself, or a direct path to the udev DB file."""
@@ -757,8 +808,15 @@ def main() -> None:
               file=sys.stderr)
         sys.exit(1)
 
-    if args.no_color or not sys.stdout.isatty():
-        sys.stdout = _NoColorStream(sys.stdout)
+    outside = escaping_links(sos_root)
+    if outside:
+        print(f"{RED}ERROR: {len(outside)} symlink(s) point outside the sosreport — refusing to "
+              f"read files of this machine:{RESET}", file=sys.stderr)
+        for rel, tgt in outside[:20]:
+            print(f"  {_CTRL_RE.sub('', rel)} -> {_CTRL_RE.sub('', tgt)}", file=sys.stderr)
+        sys.exit(1)
+
+    sys.stdout = _SafeStream(sys.stdout, color=not (args.no_color or not sys.stdout.isatty()))
 
     print(f"{DIM}ver. {__version__} ({__build_date__}){RESET}")
 
@@ -791,14 +849,14 @@ def main() -> None:
         for b in blocks:
             iface      = b.get("INTERFACE", b.get("M", "?"))
             pci        = pci_from_block(b)
-            source, _  = naming_source(b, ifnames_prefix, src_ctx)
+            source, kind = naming_source(b, ifnames_prefix, src_ctx)
             driver     = b.get("ID_NET_DRIVER", "—")
             scheme     = b.get("ID_NET_NAMING_SCHEME", "—")
             model      = b.get(
                 "ID_MODEL_FROM_DATABASE",
                 b.get("ID_MODEL_ENC", b.get("ID_MODEL", "—"))
             )
-            m = check_mismatch(b, rename_map, source)
+            m = check_mismatch(b, rename_map, source, kind)
             if m:
                 mismatches.append(m)
 

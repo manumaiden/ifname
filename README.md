@@ -49,10 +49,18 @@ python3 ifname.py --detail           # or -d, either way
 
 ```bash
 ifname -v
-# ifname version 1.1 (21102026) by manumaiden
+# ifname version 1.2 (30102026) by manumaiden
 ```
 
 On every normal run (not `-v`), the version is printed as the first line of output.
+
+## Safety
+
+A sosreport is treated as untrusted input:
+
+- terminal control sequences found in its data (udev properties, rule files) are removed before printing, so a crafted report cannot hide lines, change the window title or write to the clipboard;
+- ifname refuses to run when the extracted report contains symbolic links pointing outside the report directory (sos never creates them), so it never reads or prints files of the analyst's machine;
+- no commands are executed and nothing is sent over the network.
 
 ## Colors
 
