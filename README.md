@@ -10,8 +10,14 @@ Analyzes how network interfaces are renamed by reading a udev database, in the f
 
 ## Requirements
 
-- Python 3.9+
-- A sosreport (or a plain `udevadm info --export-db` dump) collected on a systemd-based Linux system — RHEL, Fedora, and other distributions
+- Python 3.9+ (the RHEL 9 system Python is fine)
+- A sosreport collected on a systemd-based Linux system — RHEL, Fedora, and other distributions. Without a sosreport, a `udevadm info --export-db` dump works too, saved where a sosreport would keep it:
+
+  ```bash
+  mkdir -p dump/sos_commands/devices
+  udevadm info --export-db > dump/sos_commands/devices/udevadm_info_--export-db
+  ifname dump/
+  ```
 
 ## Installation
 
@@ -49,7 +55,7 @@ python3 ifname.py --detail           # or -d, either way
 
 ```bash
 ifname -v
-# ifname version 1.3 (30102026) by manumaiden
+# ifname version 1.4 (30102026) by manumaiden
 ```
 
 On every normal run (not `-v`), the version is printed as the first line of output.
@@ -58,9 +64,17 @@ On every normal run (not `-v`), the version is printed as the first line of outp
 
 A sosreport is treated as untrusted input:
 
-- terminal control sequences found in its data (udev properties, rule files) are removed before printing, so a crafted report cannot hide lines, change the window title or write to the clipboard;
+- terminal control sequences found in its data (udev properties, rule files) are removed before printing, so a crafted report cannot hide lines, change the window title or write to the clipboard; the same goes for invisible Unicode characters and characters that reverse text direction;
 - ifname refuses to run when the extracted report contains symbolic links pointing outside the report directory (sos never creates them), so it never reads or prints files of the analyst's machine;
 - no commands are executed and nothing is sent over the network.
+
+## Tests
+
+```bash
+python3 test_ifname.py
+```
+
+Self-tests on synthetic sosreports built on the fly (invented PCI and MAC addresses): output filtering, symlinks leaving the report, malformed files, udev rule priority.
 
 ## Colors
 
@@ -93,7 +107,7 @@ The logic follows the rename procedure documented by Red Hat — RHEL 7 *Network
 
 Default `NamePolicy`: RHEL 8 `kernel database onboard slot path`, RHEL 9/10 `keep kernel database onboard slot path`. The `mac` policy (`enx*`) is never used by default. On RHEL 7, kernel `ethX` names only work reliably with a single NIC or with virtio NICs in RHEL 7 guests: in those cases disabled naming is a `[NOTE]`, not a `[WARN]`.
 
-The `Source` column does not take the first available candidate (`75-net-description.rules` always computes them, even when they are not used): it looks for what matches the real name, in this order — prefixdevname → candidate equal to the name (database/hwdb, onboard, slot, path, mac) → custom udev rule → `.link` file → ifcfg `DEVICE=` → biosdevname → kernel name `ethN`.
+The `Source` column does not take the first available candidate (`75-net-description.rules` always computes them, even when they are not used): it looks for what matches the real name, in this order — prefixdevname → custom udev rule matching the NIC by MAC (it runs before the naming policy, so it wins even when the name equals another candidate) → candidate equal to the name (database/hwdb, onboard, slot, path, mac) → custom udev rule without a MAC → `.link` file → ifcfg `DEVICE=` → biosdevname → kernel name `ethN`.
 
 ## Files read from the sosreport
 

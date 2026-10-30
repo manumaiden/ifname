@@ -11,6 +11,8 @@ Or pass the sosreport root (or the udev DB file directly) as an argument:
     python3 ifname.py /path/to/sosreport-xxx -d
 """
 
+from __future__ import annotations  # "str | None" hints on Python 3.9 (RHEL 9)
+
 import argparse
 import configparser
 import os
@@ -38,7 +40,8 @@ BG_BLUE = "\033[44m"
 # or a two-byte ESC x. Only our own colors (_OWN_SGR, exact match) may reach the terminal.
 _TERM_ESC_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
 _OWN_SGR = {RESET, BOLD, DIM, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE, BG_BLUE}
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")  # C0 (except \t \n), DEL, C1 (8-bit CSI/OSC)
+# C0 (except \t \n), DEL, C1 (8-bit CSI/OSC), invisible/bidi format chars (Trojan Source)
+_CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏‪-‮⁠-⁤⁦-⁩﻿]")
 
 
 class _SafeStream:
@@ -71,7 +74,7 @@ class _SafeStream:
         return self._s.fileno()
 
 
-__version__    = "1.3"
+__version__    = "1.4"
 __build_date__ = "30102026"
 
 UDEVADM_DB = Path("sos_commands/devices/udevadm_info_--export-db")
@@ -184,12 +187,9 @@ def parse_blocks(path: Path):
             yield block
 
 
-def get_naming_scheme(db_path: Path) -> str | None:
-    """Return the first ID_NET_NAMING_SCHEME value found in the udev DB, or None."""
-    for block in parse_blocks(db_path):
-        if "ID_NET_NAMING_SCHEME" in block:
-            return block["ID_NET_NAMING_SCHEME"]
-    return None
+def get_naming_scheme(blocks: list[dict]) -> str | None:
+    """Return the first ID_NET_NAMING_SCHEME value among the parsed blocks, or None."""
+    return next((b["ID_NET_NAMING_SCHEME"] for b in blocks if "ID_NET_NAMING_SCHEME" in b), None)
 
 
 def naming_source(block: dict, prefix: str | None = None,
@@ -208,6 +208,13 @@ def naming_source(block: dict, prefix: str | None = None,
     if prefix and re.match(rf"^{re.escape(prefix)}\d+$", iface):
         return f"prefixdevname [{prefix}<n>]", "prefixdevname"
 
+    # a rule matching this NIC's MAC runs (70-*) before the naming policy (80-*),
+    # so it wins even when it picks a name equal to another candidate
+    rmap = ctx.get("rename_map") or {"by_mac": {}, "by_name": {}}
+    hit = rmap["by_mac"].get(mac_from_block(block))
+    if hit and hit[0] == iface:
+        return f"udev rule ({hit[1]})", "udev"
+
     for key, label_ in SYSTEMD_PRIO:
         if block.get(key) == iface:
             if key == "ID_NET_NAME_ONBOARD" and "ID_NET_LABEL_ONBOARD" in block:
@@ -216,10 +223,6 @@ def naming_source(block: dict, prefix: str | None = None,
                 label_ = "mac (non-default policy)"
             return label_, "candidate"
 
-    rmap = ctx.get("rename_map") or {"by_mac": {}, "by_name": {}}
-    hit = rmap["by_mac"].get(mac_from_block(block))
-    if hit and hit[0] == iface:
-        return f"udev rule ({hit[1]})", "udev"
     if iface in rmap["by_name"]:
         return f"udev rule ({rmap['by_name'][iface]})", "udev"
     if iface in ctx.get("link_names", {}):
@@ -313,9 +316,9 @@ def check_mismatch(block: dict, rename_map: dict, source: str = "",
 def parse_cmdline(sos_root: Path):
     """Parse proc/cmdline and return relevant naming parameters."""
     f = sos_root / "proc/cmdline"
-    if not f.exists():
+    if not f.is_file():
         return None
-    raw = f.read_text().strip()
+    raw = f.read_text(errors="replace").strip()
     params = {}
     for token in raw.split():
         if "=" in token:
@@ -327,7 +330,7 @@ def parse_cmdline(sos_root: Path):
         "raw": raw,
         "net_ifnames": params.get("net.ifnames"),       # "0", "1", or None
         "biosdevname": params.get("biosdevname"),        # "0", "1", or None
-        "ifnames_prefix": params.get("net.ifnames.prefix"),  # e.g. "net", or None
+        "ifnames_prefix": params.get("net.ifnames.prefix") or None,  # e.g. "net"; empty = unset
         "naming_scheme": params.get("net.naming-scheme"),    # e.g. "rhel-9.4", or None
     }
 
@@ -640,6 +643,8 @@ def find_ifcfg_hwaddr(sos_root: Path) -> list[dict]:
         return []
     results = []
     for ifcfg in sorted(scripts_dir.glob("ifcfg-*")):
+        if not ifcfg.is_file():       # mask → /dev/null or dangling link
+            continue
         hwaddr = device = None
         for line in ifcfg.read_text(errors="replace").splitlines():
             s = line.strip()
@@ -657,12 +662,11 @@ def has_60_net_rules(sos_root: Path) -> bool:
             or (sos_root / "etc/udev/rules.d/60-net.rules").exists())
 
 
-def print_ifcfg_section(sos_root: Path, blocks: list[dict]) -> None:
+def print_ifcfg_section(sos_root: Path, blocks: list[dict], entries: list[dict],
+                        net_rules: bool) -> None:
     subsection("ifcfg HWADDR renaming  (60-net.rules / rename_device)")
 
     rules_usr = sos_root / "usr/lib/udev/rules.d"
-    net_rules = has_60_net_rules(sos_root)
-    entries = find_ifcfg_hwaddr(sos_root)
     print()
     # 60-net.rules (initscripts / initscripts-rename-device) runs rename_device
     # only for ifcfg-* with HWADDR= — "udev skips this step" otherwise.
@@ -802,16 +806,19 @@ def main() -> None:
     sos_root = resolve_sos_root(args.sosreport)
     db_path = sos_root / UDEVADM_DB
 
-    if not db_path.exists():
-        print(f"{RED}ERROR: {db_path} not found{RESET}\n"
-              f"Run from the sosreport root directory, or pass its path as an argument.",
+    red, reset = (RED, RESET) if sys.stderr.isatty() and not args.no_color else ("", "")
+    if not db_path.is_file():
+        print(f"{red}ERROR: {db_path} not found{reset}\n"
+              f"Run from the sosreport root directory, or pass its path as an argument.\n"
+              f"A plain 'udevadm info --export-db' dump must be saved as "
+              f"<dir>/{UDEVADM_DB}, then run: ifname <dir>",
               file=sys.stderr)
         sys.exit(1)
 
     outside = escaping_links(sos_root)
     if outside:
-        print(f"{RED}ERROR: {len(outside)} symlink(s) point outside the sosreport — refusing to "
-              f"read files of this machine:{RESET}", file=sys.stderr)
+        print(f"{red}ERROR: {len(outside)} symlink(s) point outside the sosreport — refusing to "
+              f"read files of this machine:{reset}", file=sys.stderr)
         for rel, tgt in outside[:20]:
             print(f"  {_CTRL_RE.sub('', rel)} -> {_CTRL_RE.sub('', tgt)}", file=sys.stderr)
         sys.exit(1)
@@ -825,10 +832,13 @@ def main() -> None:
     blocks = list(parse_blocks(db_path))
     udev_rules = find_udev_custom_rules(sos_root)
     rename_map = udev_rename_map(udev_rules)
+    link_files = find_link_files(sos_root)
+    ifcfg_entries = find_ifcfg_hwaddr(sos_root)
+    net_rules = has_60_net_rules(sos_root)
 
     # 1. Cmdline
     cmdline = parse_cmdline(sos_root)
-    print_cmdline_section(cmdline, sos_root, get_naming_scheme(db_path), blocks)
+    print_cmdline_section(cmdline, sos_root, get_naming_scheme(blocks), blocks)
     ifnames_prefix = cmdline.get("ifnames_prefix") if cmdline else None
 
     # 2. Interface table
@@ -841,9 +851,9 @@ def main() -> None:
         mismatches = []
         src_ctx = {
             "rename_map":    rename_map,
-            "link_names":    {lf["name"]: Path(lf["file"]).name for lf in find_link_files(sos_root)},
-            "ifcfg_devices": {e["device"]: e["file"] for e in find_ifcfg_hwaddr(sos_root)
-                              if e["device"]} if has_60_net_rules(sos_root) else {},
+            "link_names":    {lf["name"]: Path(lf["file"]).name for lf in link_files},
+            "ifcfg_devices": {e["device"]: e["file"] for e in ifcfg_entries
+                              if e["device"]} if net_rules else {},
         }
 
         for b in blocks:
@@ -891,10 +901,10 @@ def main() -> None:
     print_udev_rules_section(udev_rules)
 
     # 4. systemd .link files
-    print_link_files_section(find_link_files(sos_root))
+    print_link_files_section(link_files)
 
     # 5. ifcfg HWADDR renaming
-    print_ifcfg_section(sos_root, blocks)
+    print_ifcfg_section(sos_root, blocks, ifcfg_entries, net_rules)
 
 
 if __name__ == "__main__":
